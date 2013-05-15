@@ -1,0 +1,44 @@
+*** GffDoc/eStore.pm	2011-04-15 15:45:09.000000000 +0100
+--- ../GffDoc/eStore.pm	2012-08-04 14:02:23.512644082 +0100
+***************
+*** 242,252 ****
+  
+                  if(!$seq || $seq eq '' || $seq =~ /\*/) {
+                  
+                      if ($self->non_coding_cds()) {
+!                         $eTrans->biotype('non_coding_cds');
+!                         $eGene->biotype('non_coding_cds');
+!                         $non_coding++;
+!                         $log4->warn('Translation for transcript '.$mRNA->id().' contains stop codons. Re-classifying biotype as non_coding_cds');
+                      } else {
+                          Exception::GffDoc::StopCodons->throw( stage => 'ensembl', type => 'TRNSL::StopCodons', 
+                              error => 'Stop codons are no tolerated within Translations unless you run with -non_coding_cds option!'
+--- 242,269 ----
+  
+                  if(!$seq || $seq eq '' || $seq =~ /\*/) {
+                  
++                     ############### temporary modifications for cap version?!? ###############
+                      if ($self->non_coding_cds()) {
+!                         ####### gotta check there is ONLY one stop codon!?!
+!                         if ($seq =~ /^[^\*]+\*$/) {
+!                             $eTrans->biotype('terminal_stop_included');
+!                             $eGene->biotype('terminal_stop_included');
+!                             $non_coding++;
+!                             $log4->warn('Translation for transcript '.$mRNA->id().' contains a terminal stop codon. Re-classifying biotype as terminal_stop_included');
+!                         } elsif ($seq =~ /^(\w+\*\w*?){1,3}$/ && length($seq) > 10) {
+!                             $eTrans->biotype('possible_assembly_sub_error');
+!                             $eGene->biotype('possible_assembly_sub_error');
+!                             $non_coding++;
+!                             $log4->warn('Translation for transcript '.$mRNA->id().' contains 3 or less stop codons. Re-classifying biotype as possible_assembly_sub_error');
+!                         } else {
+!                             $eTrans->biotype('multiple_stop_codons');
+!                             $eGene->biotype('multiple_stop_codons');
+!                             #$eTrans->biotype('non_coding_cds');
+!                             #$eGene->biotype('non_coding_cds');
+!                             $non_coding++;
+!                             $log4->warn('Translation for transcript '.$mRNA->id().' contains multiple stop codons. Re-classifying biotype as non_coding_cds');
+!                         }
+!                     ##########################################################################
+                      } else {
+                          Exception::GffDoc::StopCodons->throw( stage => 'ensembl', type => 'TRNSL::StopCodons', 
+                              error => 'Stop codons are no tolerated within Translations unless you run with -non_coding_cds option!'

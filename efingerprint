@@ -1,0 +1,305 @@
+#!/homes/dsth/perl5/perlbrew/perls/perl-5.12.3_rh6/bin/perl
+use strict;
+use warnings;
+use Log::Log4perl qw(get_logger :levels);
+use Bio::EnsEMBL::DBSQL::DBAdaptor;
+use DBI qw(:sql_types);
+use Getopt::Long;
+
+#y log4 set-up
+my $log4 = get_logger('Cap::Gff');
+$log4->level($DEBUG);
+my $appender1 = Log::Log4perl::Appender->new('Log::Dispatch::Screen');
+my $layout = Log::Log4perl::Layout::PatternLayout->new("CAPPROC : [%p] : %d : %m%n");
+$appender1->layout($layout);
+$log4->add_appender($appender1);
+
+my $crc_debug = q{};
+my $cd = q{};
+my $cd1 = q{};
+my $cd2 = q{};
+my $cd3 = q{};
+my $cd4 = q{};
+if ($crc_debug) { ($cd, $cd1, $cd2, $cd3, $cd4) = qw/_=_ 1@ 2@ 3@ 4@/; }
+
+my $schema = 0;
+my $interval = 35;
+my $db = q{};
+my $dbuser = q{};#$ENV{user};
+my $dbhost = q{};#$ENV{srv}; 
+my $dbpass = q{};#$ENV{pass};
+my $dbport = q{};#$ENV{port};
+my $crc64 = '/homes/dsth/dev/crc64';
+my $table = 'files';
+my $threads = 17;
+my $upload_dir = q{};
+my $name_length = 256;
+my $prohibited_types = qr{three_prime_UTR|five_prime_UTR|protein|polypeptide|contig|supercontig};
+my $insert_only = 0; 
+my ($user,$sbmid,$uid,$sbm_file);
+my $initial_populate = 0;
+my @permitted_biotypes = qw{mRNA miRNA pseudogene ncRNA};
+my $mode = q{};
+my $file = q{};
+my $check = 0;
+
+##### ':' makes optional, '=' makes required...
+&GetOptions( 
+    'check'         =>  \$check,
+    'schema'        =>  \$schema,
+    'initialise'    =>  \$initial_populate,
+    'crc64=s'       =>  \$crc64,
+    'file=s'        =>  \$sbm_file,
+    'host=s'      =>  \$dbhost,
+    'dbname=s'      =>  \$db,
+    'user=s'      =>  \$dbuser,
+    'port=s'      =>  \$dbport,
+    'pass=s'      =>  \$dbpass,
+    'upload_dir=s'  =>  \$upload_dir,
+    'capuser=s'     =>  \$user,
+    'capuid=s'      =>  \$uid,
+    'sbmid=s'       =>  \$sbmid,
+);
+
+if ($check) {
+    exit(0);
+} elsif ($initial_populate) {
+    if (!$db || !$dbhost || !$dbuser|| !$dbpass || !$dbport) {
+        print qq{\nUsage: $0 -initialise -dbname <db> }
+          .qq{-dbhost <host> -dbuser <user> -dbport <port> -dbpass <pass>\n};
+        exit(0);
+    }
+    $threads = 17;
+    $initial_populate = 1;
+    $sbmid = 0;
+    $user = 'admin';
+    $uid = 0;
+} else {
+    if (!$db    || !$dbhost || !$dbuser|| !$dbpass || !$dbport || !$sbmid ) {
+        print qq{\nUsage: $0 -file <filename> -dbname <db> -dbhost <host> -dbuser <user> -dbport <port> -dbpass <pass> -sbmid <sbmid>\n};
+    exit(0);
+    }
+    $threads=1;
+
+    my @time = localtime;
+    my @mon = qw/Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec/;
+    $time[5] -= 100;
+    my $tstamp = $time[3].$mon[$time[4]].$time[5];
+    my $logfile = 'gff_'.$tstamp.'.log';
+    my $appender2 = Log::Log4perl::Appender->new("Log::Dispatch::File",filename=>$logfile,mode=>"append");
+    $log4->add_appender($appender2);
+}
+
+my $dbstr = qq{DBI:mysql:database=$db;host=$dbhost;port=$dbport;}
+  .qq{user=$dbuser;password=$dbpass};
+my $dbhashref = {PrintError => 1, RaiseError => 1};
+my $dbi = DBI->connect($dbstr, $dbhashref) or die;
+
+my $dbAd = Bio::EnsEMBL::DBSQL::DBAdaptor->new(
+    -host   => $dbhost,
+    -user   => $dbuser,
+    -port   => $dbport,
+    -pass   => $dbpass,
+    -dbname => $db,
+);
+
+if ($initial_populate) {
+    my $clean_sth = $dbi->prepare('truncate table feat');
+    $log4->info('Initialising cap db.');
+    $log4->info('Truncating canon_crc64 table.');
+    $clean_sth = $dbi->prepare('truncate table canon_crc64');
+    $clean_sth->execute() or die;
+} else {
+    $log4->info(qq{Processing cap db with new submission with submission=$sbmid.});
+}    
+
+my $genes_to_process = 'select gene_id from gene where cap_sbm_id is NULL';
+my $gene_ids_sth = $dbi->prepare($genes_to_process);
+$gene_ids_sth->execute() or die;
+my @gene_ids = map{$_->[0]}@{$gene_ids_sth->fetchall_arrayref};
+my $g_num = scalar @gene_ids;
+
+if ($g_num==0) {
+    $log4->error("There's nothing to process - Exiting.");
+    exit(0);
+}
+
+$log4->info("Processing $g_num genes.");
+
+my @keepers; 
+my @remove;
+my %inserted_crc; 
+&_thread_crc($dbAd,$sbmid,@gene_ids);
+
+if ($initial_populate) {
+
+    $log4->info(qq{Removing all genes - the quick and dirty way.});
+    my $clean_sth = $dbi->prepare('truncate table gene');
+    $clean_sth->execute() or die;
+    $clean_sth = $dbi->prepare('truncate table transcript');
+    $clean_sth->execute() or die;
+    $clean_sth = $dbi->prepare('truncate table translation');
+    $clean_sth->execute() or die;
+    $clean_sth = $dbi->prepare('truncate table exon');
+    $clean_sth->execute() or die;
+    $clean_sth = $dbi->prepare('truncate table exon_transcript');
+    $clean_sth->execute() or die;
+    $clean_sth = $dbi->prepare('truncate supporting_feature'); # no need...
+    $clean_sth->execute() or die;
+    $clean_sth = $dbi->prepare('truncate transcript_supporting_feature');
+    $clean_sth->execute() or die;
+    $log4->info(qq{Database is ready for cap submissions.});
+
+} else {
+
+    my $protect_gene = $dbi->prepare(q{update gene set cap_source = 'cap', cap_sbm_id = ? where gene_id = ?});
+    my $protected = 0;
+    for my $gene_id (@keepers) {
+        $protect_gene->bind_param( 1, $sbmid,   SQL_INTEGER );
+        $protect_gene->bind_param( 2, $gene_id,   SQL_INTEGER );
+        $protect_gene->execute || die qq{\ncouldn't protect gene!};
+        $protected++;
+    }
+
+    # leave string alone!?! used by monitor!?!
+    $log4->info("Protected $protected new gene models.");
+
+    my $gene_remove_ids_sth = $dbi->prepare($genes_to_process);
+    $gene_remove_ids_sth->execute() or die;
+    my @gene_remove_ids = map{$_->[0]}@{$gene_remove_ids_sth->fetchall_arrayref};
+
+    $log4->info('Removing all unprotected genes.');
+
+    my $gad = $dbAd->get_GeneAdaptor || die;
+
+    my $removed = 0;
+    for (@gene_remove_ids) {
+        &wipe_unprotected($_,$gad);
+        $removed++;
+    }
+
+    # leave string alone!?! used by monitor!?!
+    $log4->info("Removed $removed unprotected old gene models.");
+}
+
+sub wipe_unprotected {
+
+    my $gene_id = shift;
+    my $gad = shift;
+    my $gene_Ens = $gad->fetch_by_dbID($gene_id) || die;
+
+    eval { $gad->remove($gene_Ens); };
+    if($@) {
+        print q{### Couldn't remove gene}.$gene_id.qq{ ($@)\n};
+        return;
+    } else {}
+    return;
+}
+
+$log4->info("All done.");
+
+exit(0);
+
+sub print_number {
+    my ($str) = @_;
+    system qq{echo -n $str};
+    return;
+}
+
+sub print_clean {
+    my $l = shift;
+    print qq{\x08} x $l;
+    return;
+}
+
+sub _thread_crc {
+
+    my $dbAd = shift;
+    my $sbmid = shift;
+    my @sub_genes = @_;
+
+    my $gad = $dbAd->get_GeneAdaptor || die;
+
+    my $crc_check_sth = $dbi->prepare(qq{select count(1) from canon_crc64 where crc64 = ?});
+    my $crc_insert_sth = $dbi->prepare(qq{insert into canon_crc64 set crc64 = ? });
+
+    my $c = 0;
+    my $l = scalar @sub_genes;
+
+    for my $gene_id (@sub_genes) {
+
+        my $gene = $gad->fetch_by_dbID($gene_id) || die qq{\ncouldn't fetch gene object with dbID $gene_id};
+
+        $c++;
+        my $int = int($l/100);
+        $int ||= 1;
+        printf("\r%02s%%",int(100*$c/$l)) if ($c % $int == 0);
+
+        my @gene_feat_list;
+        my @gene_feat_rel_list;
+
+        my $g_string = $cd1.$gene->slice->seq_region_name.$cd.$gene->strand.$cd.$gene->start.$cd.$gene->end;
+
+        my @mrna_strings;
+        for my $mrna (@{$gene->get_all_Transcripts}) {
+
+            my @exon_strings;
+            my @cds_strings;
+
+            for my $p (@{$mrna->get_all_Exons()}) {
+                push @exon_strings,$cd3.$p->slice->seq_region_name.$cd.$p->strand.$cd.$p->start.$cd.$p->end;
+            }
+
+            for my $p (@{$mrna->get_all_translateable_Exons()}) {
+                push @exon_strings,$cd3.$p->slice->seq_region_name.$cd.$p->strand.$cd.$p->start.$cd.$p->end;
+            }
+
+            @exon_strings = sort {$a cmp $b} @exon_strings;
+            @cds_strings = sort {$a cmp $b} @cds_strings;
+            my $es = join(q{},@exon_strings);
+            my $cs = join(q{},@cds_strings);
+            push @mrna_strings, $cd2.$mrna->slice->seq_region_name.$cd.$mrna->strand.$cd.$mrna->start.$cd.$mrna->end.$es.$cs;
+
+        }
+
+        @mrna_strings = sort {$a cmp $b} @mrna_strings;
+        my $ms = join(q{},@mrna_strings);
+        $g_string .= $ms;
+        my $g_crc64 = `$crc64 $g_string`;
+
+        if ($crc_debug) {
+            $g_string =~ s/1@/\n[gene]\t/g;
+            $g_string =~ s/2@/\n\t[tran]\t/g;
+            $g_string =~ s/3@/\n\t\t[exon]\t/g;
+            $g_string =~ s/4@/\n\t\t[cdss]\t/g;
+            print qq{\n[start] search-name: $crc_debug stored-name: ${g_string}\n[end] -> $g_crc64\n};
+        }
+
+        if($initial_populate) {
+            if (exists $inserted_crc{$g_crc64}) { 
+                $log4->warn("Gene with dbID $gene_id is a duplicated within database");
+                next;
+            }
+            $inserted_crc{$g_crc64} = 1;
+            $crc_insert_sth->execute($g_crc64) or die;
+        } else {
+            $crc_check_sth->execute($g_crc64) or die;
+            my $out = $crc_check_sth->fetchrow_arrayref->[0];
+            if ($out==1) { 
+            #if (@{$crc__sth->fetchall_arrayref()}) { 
+                push @remove, $gene_id;
+            } elsif ($out==0) {
+                push @keepers, $gene_id;
+                #$protect_gene->bind_param( 1, $sbmid,   SQL_INTEGER );
+                #$protect_gene->bind_param( 2, $gene_id,   SQL_INTEGER );
+                #$protect_gene->execute || die qq{\ncouldn't protect gene!};
+                #lock($modified);
+                #$modified++;
+            } else {
+                die qq{bugger};
+            }
+        }
+
+    }
+    return;
+}    
